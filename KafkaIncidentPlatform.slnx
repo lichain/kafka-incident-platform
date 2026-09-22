@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/EventGenerator/EventGenerator.csproj" />
+    <Project Path="src/IncidentDetector/IncidentDetector.csproj" />
+  </Folder>
+</Solution>
