@@ -2,17 +2,28 @@ using System.Text.Json;
 using Confluent.Kafka;
 using Microsoft.Data.Sqlite;
 
-var builder = WebApplication.CreateBuilder(args);
+var rebuildRequested = args.Contains("--rebuild", StringComparer.OrdinalIgnoreCase)
+    || bool.TryParse(Environment.GetEnvironmentVariable("REBUILD_PROJECTION"), out var rebuildFromEnvironment)
+       && rebuildFromEnvironment;
+var applicationArgs = args
+    .Where(argument => !string.Equals(argument, "--rebuild", StringComparison.OrdinalIgnoreCase))
+    .ToArray();
+var builder = WebApplication.CreateBuilder(applicationArgs);
 var dataDirectory = Path.Combine("data");
 Directory.CreateDirectory(dataDirectory);
 
+var baseGroupId = Environment.GetEnvironmentVariable("INCIDENT_PROJECTION_GROUP") ?? "incident-projection-v1";
+var groupId = rebuildRequested
+    ? $"{baseGroupId}-rebuild-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}"
+    : baseGroupId;
 var options = new ProjectionOptions(
     $"Data Source={Path.Combine(dataDirectory, "incident-projection.db")};Cache=Shared",
     Environment.GetEnvironmentVariable("KAFKA_BOOTSTRAP_SERVERS") ?? "localhost:9092",
-    Environment.GetEnvironmentVariable("INCIDENT_PROJECTION_GROUP") ?? "incident-projection-v1",
-    "incident-events");
+    groupId,
+    "incident-events",
+    rebuildRequested);
 var database = new ProjectionDatabase(options.ConnectionString);
-await database.InitializeAsync();
+await database.InitializeAsync(options.RebuildMode);
 
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(database);
@@ -29,12 +40,26 @@ app.MapGet("/incidents/{id:guid}", async (Guid id, ProjectionDatabase projection
     return incident is null ? Results.NotFound() : Results.Ok(incident);
 });
 
-app.MapGet("/projection/stats", async (ProjectionDatabase projection, CancellationToken token) =>
-    Results.Ok(await projection.GetStatsAsync(token)));
+app.MapGet("/projection/stats", async (ProjectionDatabase projection, ProjectionOptions current, CancellationToken token) =>
+{
+    var stats = await projection.GetStatsAsync(token);
+    return Results.Ok(new
+    {
+        current.GroupId,
+        current.RebuildMode,
+        stats.Incidents,
+        stats.ProcessedEvents
+    });
+});
 
 app.Run();
 
-record ProjectionOptions(string ConnectionString, string BootstrapServers, string GroupId, string Topic);
+record ProjectionOptions(
+    string ConnectionString,
+    string BootstrapServers,
+    string GroupId,
+    string Topic,
+    bool RebuildMode);
 record IncidentView(
     Guid Id,
     string Service,
@@ -46,7 +71,7 @@ record ProjectionStats(long Incidents, long ProcessedEvents);
 
 sealed class ProjectionDatabase(string connectionString)
 {
-    public async Task InitializeAsync()
+    public async Task InitializeAsync(bool rebuild)
     {
         await using var connection = await OpenConnectionAsync(CancellationToken.None);
         var command = connection.CreateCommand();
@@ -69,6 +94,19 @@ sealed class ProjectionDatabase(string connectionString)
             );
             """;
         await command.ExecuteNonQueryAsync();
+
+        if (rebuild)
+        {
+            using var transaction = connection.BeginTransaction();
+            var reset = connection.CreateCommand();
+            reset.Transaction = transaction;
+            reset.CommandText = """
+                DELETE FROM incident_read_model;
+                DELETE FROM processed_messages;
+                """;
+            await reset.ExecuteNonQueryAsync();
+            transaction.Commit();
+        }
     }
 
     public async Task<bool> ApplyAsync(ConsumeResult<string, string> message, CancellationToken token)
@@ -291,9 +329,10 @@ sealed class IncidentProjectionWorker(
             .Build();
         consumer.Subscribe(options.Topic);
         logger.LogInformation(
-            "Projecting {Topic} as consumer group {GroupId}",
+            "Projecting {Topic} as consumer group {GroupId} (rebuild: {RebuildMode})",
             options.Topic,
-            options.GroupId);
+            options.GroupId,
+            options.RebuildMode);
 
         try
         {
