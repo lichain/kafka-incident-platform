@@ -24,6 +24,8 @@ See [Day 07 guide](docs/day-07.md) for consumer lag experiments.
 
 See [Day 08 guide](docs/day-08.md) for batch-consumer experiments.
 
+See [Day 09 guide](docs/day-09.md) for poison-message and DLQ handling.
+
 ## Kafka UI
 
 Run `docker compose up -d`, then open http://localhost:8080 to inspect the local broker, topics, partitions, messages and consumer groups.

@@ -8,6 +8,13 @@ var bootstrapServers = Environment.GetEnvironmentVariable("KAFKA_BOOTSTRAP_SERVE
 using var processedEventStore = options.IdempotencyMode == "sqlite"
     ? new SqliteProcessedEventStore(Path.Combine("data", "processed-events.db"))
     : null;
+using var dlqProducer = options.FailureMode == "dlq-on-error"
+    ? new ProducerBuilder<string, string>(new ProducerConfig
+    {
+        BootstrapServers = bootstrapServers,
+        ClientId = "incident-detector-dlq"
+    }).Build()
+    : null;
 
 using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
 {
@@ -25,7 +32,7 @@ using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
     .Build();
 
 consumer.Subscribe(Topic);
-Console.WriteLine($"Consuming '{Topic}' as '{options.GroupId}' via {bootstrapServers} (batch: {options.BatchSize}, commit: {options.CommitMode}, idempotency: {options.IdempotencyMode}, delay: {options.ProcessingDelayMs}ms, session timeout: {options.SessionTimeoutMs}ms, max.poll.interval: {options.MaxPollIntervalMs}ms). Press Ctrl+C to stop.");
+Console.WriteLine($"Consuming '{Topic}' as '{options.GroupId}' via {bootstrapServers} (batch: {options.BatchSize}, commit: {options.CommitMode}, idempotency: {options.IdempotencyMode}, failure mode: {options.FailureMode}, delay: {options.ProcessingDelayMs}ms, session timeout: {options.SessionTimeoutMs}ms, max.poll.interval: {options.MaxPollIntervalMs}ms). Press Ctrl+C to stop.");
 
 try
 {
@@ -46,6 +53,26 @@ try
         {
             var appEvent = JsonSerializer.Deserialize<AppEvent>(result.Message.Value)
                 ?? throw new JsonException("Kafka message did not contain an app event.");
+
+            if (options.FailureMode == "dlq-on-error" && appEvent.Level == "Error")
+            {
+                var deadLetter = new DeadLetterEvent(
+                    Topic,
+                    result.Partition.Value,
+                    result.Offset.Value,
+                    result.Message.Key,
+                    result.Message.Value,
+                    "Simulated processing failure for an Error event.",
+                    DateTimeOffset.UtcNow);
+                await dlqProducer!.ProduceAsync($"{Topic}.dlq", new Message<string, string>
+                {
+                    Key = result.Message.Key,
+                    Value = JsonSerializer.Serialize(deadLetter)
+                });
+                Console.WriteLine($"sent to DLQ: partition={result.Partition} offset={result.Offset} reason=simulated-error");
+                commitOffsets[result.TopicPartition] = result.Offset + 1;
+                continue;
+            }
 
             if (processedEventStore is not null && !processedEventStore.TryMarkProcessed(appEvent.EventId))
             {
@@ -79,6 +106,7 @@ static ConsumerOptions ParseOptions(string[] arguments)
     var sessionTimeoutMs = 45_000;
     var maxPollIntervalMs = 300_000;
     var batchSize = 1;
+    var failureMode = "none";
 
     for (var index = 0; index < arguments.Length; index += 2)
     {
@@ -108,12 +136,15 @@ static ConsumerOptions ParseOptions(string[] arguments)
             case ("--batch-size", var value) when int.TryParse(value, out var size) && size > 0:
                 batchSize = size;
                 break;
+            case ("--failure-mode", "none" or "dlq-on-error"):
+                failureMode = arguments[index + 1];
+                break;
             default:
-                throw new ArgumentException("Usage: dotnet run --project src/IncidentDetector -- [--group <name>] [--commit manual|none] [--idempotency none|sqlite] [--delay-ms <number>] [--session-timeout-ms <number>] [--max-poll-interval-ms <number>] [--batch-size <number>]");
+                throw new ArgumentException("Usage: dotnet run --project src/IncidentDetector -- [--group <name>] [--commit manual|none] [--idempotency none|sqlite] [--delay-ms <number>] [--session-timeout-ms <number>] [--max-poll-interval-ms <number>] [--batch-size <number>] [--failure-mode none|dlq-on-error]");
         }
     }
 
-    return new ConsumerOptions(groupId, commitMode, idempotencyMode, processingDelayMs, sessionTimeoutMs, maxPollIntervalMs, batchSize);
+    return new ConsumerOptions(groupId, commitMode, idempotencyMode, processingDelayMs, sessionTimeoutMs, maxPollIntervalMs, batchSize, failureMode);
 }
 
 static void TryCommit(IConsumer<string, string> consumer, IEnumerable<TopicPartitionOffset> offsets)
@@ -137,7 +168,17 @@ internal sealed record ConsumerOptions(
     int ProcessingDelayMs,
     int SessionTimeoutMs,
     int MaxPollIntervalMs,
-    int BatchSize);
+    int BatchSize,
+    string FailureMode);
+
+internal sealed record DeadLetterEvent(
+    string OriginalTopic,
+    int OriginalPartition,
+    long OriginalOffset,
+    string OriginalKey,
+    string OriginalValue,
+    string FailureReason,
+    DateTimeOffset FailedAt);
 
 internal sealed class SqliteProcessedEventStore : IDisposable
 {
