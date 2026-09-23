@@ -13,7 +13,7 @@ using var producer = new ProducerBuilder<string, string>(new ProducerConfig
 var routing = options.ForcedPartition is null
     ? $"key-based partitioning ({options.KeyMode} key)"
     : $"forced partition {options.ForcedPartition}";
-Console.WriteLine($"Producing to '{Topic}' via {bootstrapServers} ({routing}). Press Ctrl+C to stop.");
+Console.WriteLine($"Producing to '{Topic}' via {bootstrapServers} ({routing}, interval: {options.IntervalMs}ms). Press Ctrl+C to stop.");
 for (var sequence = 1; ; sequence++)
 {
     var service = (sequence % 3) switch { 0 => "payment-api", 1 => "order-api", _ => "user-api" };
@@ -29,13 +29,14 @@ for (var sequence = 1; ; sequence++)
         ? await producer.ProduceAsync(Topic, message)
         : await producer.ProduceAsync(new TopicPartition(Topic, new Partition(options.ForcedPartition.Value)), message);
     Console.WriteLine($"#{sequence} key={key,-36} partition={delivery.Partition} offset={delivery.Offset} level={appEvent.Level}");
-    await Task.Delay(TimeSpan.FromSeconds(1));
+    await Task.Delay(options.IntervalMs);
 }
 
 static GeneratorOptions ParseOptions(string[] arguments)
 {
     int? forcedPartition = null;
     var keyMode = "service";
+    var intervalMs = 1000;
 
     for (var index = 0; index < arguments.Length; index += 2)
     {
@@ -50,14 +51,17 @@ static GeneratorOptions ParseOptions(string[] arguments)
             case ("--key", "service" or "event"):
                 keyMode = arguments[index + 1];
                 break;
+            case ("--interval-ms", var value) when int.TryParse(value, out var interval) && interval >= 0:
+                intervalMs = interval;
+                break;
             default:
-                throw new ArgumentException("Usage: dotnet run --project src/EventGenerator -- [--key service|event] [--partition <non-negative number>]");
+                throw new ArgumentException("Usage: dotnet run --project src/EventGenerator -- [--key service|event] [--partition <non-negative number>] [--interval-ms <number>]");
         }
     }
 
-    return new GeneratorOptions(forcedPartition, keyMode);
+    return new GeneratorOptions(forcedPartition, keyMode, intervalMs);
 }
 
 internal sealed record AppEvent(Guid EventId, string Service, string Level, string Message, DateTimeOffset OccurredAt);
 
-internal sealed record GeneratorOptions(int? ForcedPartition, string KeyMode);
+internal sealed record GeneratorOptions(int? ForcedPartition, string KeyMode, int IntervalMs);
