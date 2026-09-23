@@ -25,29 +25,44 @@ using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
     .Build();
 
 consumer.Subscribe(Topic);
-Console.WriteLine($"Consuming '{Topic}' as '{options.GroupId}' via {bootstrapServers} (commit: {options.CommitMode}, idempotency: {options.IdempotencyMode}, delay: {options.ProcessingDelayMs}ms, session timeout: {options.SessionTimeoutMs}ms, max.poll.interval: {options.MaxPollIntervalMs}ms). Press Ctrl+C to stop.");
+Console.WriteLine($"Consuming '{Topic}' as '{options.GroupId}' via {bootstrapServers} (batch: {options.BatchSize}, commit: {options.CommitMode}, idempotency: {options.IdempotencyMode}, delay: {options.ProcessingDelayMs}ms, session timeout: {options.SessionTimeoutMs}ms, max.poll.interval: {options.MaxPollIntervalMs}ms). Press Ctrl+C to stop.");
 
 try
 {
     while (true)
     {
-        var result = consumer.Consume();
-        var appEvent = JsonSerializer.Deserialize<AppEvent>(result.Message.Value)
-            ?? throw new JsonException("Kafka message did not contain an app event.");
-
-        if (processedEventStore is not null && !processedEventStore.TryMarkProcessed(appEvent.EventId))
+        var batch = new List<ConsumeResult<string, string>> { consumer.Consume() };
+        while (batch.Count < options.BatchSize)
         {
-            Console.WriteLine($"duplicate eventId={appEvent.EventId} partition={result.Partition} offset={result.Offset}; skipped");
-            if (options.CommitMode == "manual")
-                TryCommit(consumer, result);
-            continue;
+            var next = consumer.Consume(TimeSpan.FromMilliseconds(25));
+            if (next is null)
+                break;
+            batch.Add(next);
         }
 
-        Console.WriteLine($"key={result.Message.Key,-12} partition={result.Partition} offset={result.Offset} level={appEvent.Level} message={appEvent.Message}");
-        if (options.ProcessingDelayMs > 0)
-            await Task.Delay(options.ProcessingDelayMs);
+        Console.WriteLine($"processing batch: {batch.Count} record(s)");
+        var commitOffsets = new Dictionary<TopicPartition, Offset>();
+        foreach (var result in batch)
+        {
+            var appEvent = JsonSerializer.Deserialize<AppEvent>(result.Message.Value)
+                ?? throw new JsonException("Kafka message did not contain an app event.");
+
+            if (processedEventStore is not null && !processedEventStore.TryMarkProcessed(appEvent.EventId))
+            {
+                Console.WriteLine($"duplicate eventId={appEvent.EventId} partition={result.Partition} offset={result.Offset}; skipped");
+            }
+            else
+            {
+                Console.WriteLine($"key={result.Message.Key,-12} partition={result.Partition} offset={result.Offset} level={appEvent.Level} message={appEvent.Message}");
+                if (options.ProcessingDelayMs > 0)
+                    await Task.Delay(options.ProcessingDelayMs);
+            }
+
+            commitOffsets[result.TopicPartition] = result.Offset + 1;
+        }
+
         if (options.CommitMode == "manual")
-            TryCommit(consumer, result);
+            TryCommit(consumer, commitOffsets.Select(item => new TopicPartitionOffset(item.Key, item.Value)));
     }
 }
 finally
@@ -63,6 +78,7 @@ static ConsumerOptions ParseOptions(string[] arguments)
     var processingDelayMs = 0;
     var sessionTimeoutMs = 45_000;
     var maxPollIntervalMs = 300_000;
+    var batchSize = 1;
 
     for (var index = 0; index < arguments.Length; index += 2)
     {
@@ -89,23 +105,26 @@ static ConsumerOptions ParseOptions(string[] arguments)
             case ("--max-poll-interval-ms", var value) when int.TryParse(value, out var interval) && interval > 0:
                 maxPollIntervalMs = interval;
                 break;
+            case ("--batch-size", var value) when int.TryParse(value, out var size) && size > 0:
+                batchSize = size;
+                break;
             default:
-                throw new ArgumentException("Usage: dotnet run --project src/IncidentDetector -- [--group <name>] [--commit manual|none] [--idempotency none|sqlite] [--delay-ms <number>] [--session-timeout-ms <number>] [--max-poll-interval-ms <number>]");
+                throw new ArgumentException("Usage: dotnet run --project src/IncidentDetector -- [--group <name>] [--commit manual|none] [--idempotency none|sqlite] [--delay-ms <number>] [--session-timeout-ms <number>] [--max-poll-interval-ms <number>] [--batch-size <number>]");
         }
     }
 
-    return new ConsumerOptions(groupId, commitMode, idempotencyMode, processingDelayMs, sessionTimeoutMs, maxPollIntervalMs);
+    return new ConsumerOptions(groupId, commitMode, idempotencyMode, processingDelayMs, sessionTimeoutMs, maxPollIntervalMs, batchSize);
 }
 
-static void TryCommit(IConsumer<string, string> consumer, ConsumeResult<string, string> result)
+static void TryCommit(IConsumer<string, string> consumer, IEnumerable<TopicPartitionOffset> offsets)
 {
     try
     {
-        consumer.Commit(result);
+        consumer.Commit(offsets);
     }
     catch (KafkaException exception)
     {
-        Console.WriteLine($"commit failed for partition={result.Partition} offset={result.Offset}: {exception.Error.Reason}. The record may be delivered again after rebalance.");
+        Console.WriteLine($"batch commit failed: {exception.Error.Reason}. Records may be delivered again after rebalance.");
     }
 }
 
@@ -117,7 +136,8 @@ internal sealed record ConsumerOptions(
     string IdempotencyMode,
     int ProcessingDelayMs,
     int SessionTimeoutMs,
-    int MaxPollIntervalMs);
+    int MaxPollIntervalMs,
+    int BatchSize);
 
 internal sealed class SqliteProcessedEventStore : IDisposable
 {

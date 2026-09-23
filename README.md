@@ -22,6 +22,8 @@ See [Day 06 guide](docs/day-06.md) for rebalance-safe commit failure handling.
 
 See [Day 07 guide](docs/day-07.md) for consumer lag experiments.
 
+See [Day 08 guide](docs/day-08.md) for batch-consumer experiments.
+
 ## Kafka UI
 
 Run `docker compose up -d`, then open http://localhost:8080 to inspect the local broker, topics, partitions, messages and consumer groups.
