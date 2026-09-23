@@ -16,6 +16,10 @@ See [Day 03 guide](docs/day-03.md) for consumer offsets and commit experiments.
 
 See [Day 04 guide](docs/day-04.md) for idempotent consumer experiments.
 
+See [Day 05 guide](docs/day-05.md) for slow-consumer and rebalance experiments.
+
+See [Day 06 guide](docs/day-06.md) for rebalance-safe commit failure handling.
+
 ## Kafka UI
 
 Run `docker compose up -d`, then open http://localhost:8080 to inspect the local broker, topics, partitions, messages and consumer groups.

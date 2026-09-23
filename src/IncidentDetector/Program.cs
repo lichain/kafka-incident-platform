@@ -14,11 +14,18 @@ using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
     BootstrapServers = bootstrapServers,
     GroupId = options.GroupId,
     AutoOffsetReset = AutoOffsetReset.Earliest,
-    EnableAutoCommit = false
-}).Build();
+    EnableAutoCommit = false,
+    SessionTimeoutMs = options.SessionTimeoutMs,
+    MaxPollIntervalMs = options.MaxPollIntervalMs
+})
+    .SetPartitionsAssignedHandler((_, partitions) =>
+        Console.WriteLine($"assigned: {string.Join(", ", partitions)}"))
+    .SetPartitionsRevokedHandler((_, partitions) =>
+        Console.WriteLine($"revoked: {string.Join(", ", partitions)}"))
+    .Build();
 
 consumer.Subscribe(Topic);
-Console.WriteLine($"Consuming '{Topic}' as '{options.GroupId}' via {bootstrapServers} (commit: {options.CommitMode}, idempotency: {options.IdempotencyMode}). Press Ctrl+C to stop.");
+Console.WriteLine($"Consuming '{Topic}' as '{options.GroupId}' via {bootstrapServers} (commit: {options.CommitMode}, idempotency: {options.IdempotencyMode}, delay: {options.ProcessingDelayMs}ms, session timeout: {options.SessionTimeoutMs}ms, max.poll.interval: {options.MaxPollIntervalMs}ms). Press Ctrl+C to stop.");
 
 try
 {
@@ -32,13 +39,15 @@ try
         {
             Console.WriteLine($"duplicate eventId={appEvent.EventId} partition={result.Partition} offset={result.Offset}; skipped");
             if (options.CommitMode == "manual")
-                consumer.Commit(result);
+                TryCommit(consumer, result);
             continue;
         }
 
         Console.WriteLine($"key={result.Message.Key,-12} partition={result.Partition} offset={result.Offset} level={appEvent.Level} message={appEvent.Message}");
+        if (options.ProcessingDelayMs > 0)
+            await Task.Delay(options.ProcessingDelayMs);
         if (options.CommitMode == "manual")
-            consumer.Commit(result);
+            TryCommit(consumer, result);
     }
 }
 finally
@@ -51,6 +60,9 @@ static ConsumerOptions ParseOptions(string[] arguments)
     var groupId = "incident-detector";
     var commitMode = "manual";
     var idempotencyMode = "none";
+    var processingDelayMs = 0;
+    var sessionTimeoutMs = 45_000;
+    var maxPollIntervalMs = 300_000;
 
     for (var index = 0; index < arguments.Length; index += 2)
     {
@@ -68,17 +80,44 @@ static ConsumerOptions ParseOptions(string[] arguments)
             case ("--idempotency", "none" or "sqlite"):
                 idempotencyMode = arguments[index + 1];
                 break;
+            case ("--delay-ms", var value) when int.TryParse(value, out var delay) && delay >= 0:
+                processingDelayMs = delay;
+                break;
+            case ("--session-timeout-ms", var value) when int.TryParse(value, out var timeout) && timeout > 0:
+                sessionTimeoutMs = timeout;
+                break;
+            case ("--max-poll-interval-ms", var value) when int.TryParse(value, out var interval) && interval > 0:
+                maxPollIntervalMs = interval;
+                break;
             default:
-                throw new ArgumentException("Usage: dotnet run --project src/IncidentDetector -- [--group <name>] [--commit manual|none] [--idempotency none|sqlite]");
+                throw new ArgumentException("Usage: dotnet run --project src/IncidentDetector -- [--group <name>] [--commit manual|none] [--idempotency none|sqlite] [--delay-ms <number>] [--session-timeout-ms <number>] [--max-poll-interval-ms <number>]");
         }
     }
 
-    return new ConsumerOptions(groupId, commitMode, idempotencyMode);
+    return new ConsumerOptions(groupId, commitMode, idempotencyMode, processingDelayMs, sessionTimeoutMs, maxPollIntervalMs);
+}
+
+static void TryCommit(IConsumer<string, string> consumer, ConsumeResult<string, string> result)
+{
+    try
+    {
+        consumer.Commit(result);
+    }
+    catch (KafkaException exception)
+    {
+        Console.WriteLine($"commit failed for partition={result.Partition} offset={result.Offset}: {exception.Error.Reason}. The record may be delivered again after rebalance.");
+    }
 }
 
 internal sealed record AppEvent(Guid EventId, string Service, string Level, string Message, DateTimeOffset OccurredAt);
 
-internal sealed record ConsumerOptions(string GroupId, string CommitMode, string IdempotencyMode);
+internal sealed record ConsumerOptions(
+    string GroupId,
+    string CommitMode,
+    string IdempotencyMode,
+    int ProcessingDelayMs,
+    int SessionTimeoutMs,
+    int MaxPollIntervalMs);
 
 internal sealed class SqliteProcessedEventStore : IDisposable
 {
