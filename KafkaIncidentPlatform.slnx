@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/EventGenerator/EventGenerator.csproj" />
     <Project Path="src/IncidentDetector/IncidentDetector.csproj" />
+    <Project Path="src/IncidentService/IncidentService.csproj" />
     <Project Path="src/RetryWorker/RetryWorker.csproj" />
   </Folder>
 </Solution>
