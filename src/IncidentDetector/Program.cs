@@ -8,12 +8,15 @@ var bootstrapServers = Environment.GetEnvironmentVariable("KAFKA_BOOTSTRAP_SERVE
 using var processedEventStore = options.IdempotencyMode == "sqlite"
     ? new SqliteProcessedEventStore(Path.Combine("data", "processed-events.db"))
     : null;
-using var dlqProducer = options.FailureMode == "dlq-on-error"
+using var dlqProducer = options.FailureMode is "dlq-on-error" or "retry-on-error"
     ? new ProducerBuilder<string, string>(new ProducerConfig
     {
         BootstrapServers = bootstrapServers,
         ClientId = "incident-detector-dlq"
     }).Build()
+    : null;
+using var retryProducer = options.FailureMode == "retry-on-error"
+    ? new ProducerBuilder<string, string>(new ProducerConfig { BootstrapServers = bootstrapServers, ClientId = "incident-detector-retry" }).Build()
     : null;
 
 using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
@@ -70,6 +73,29 @@ try
                     Value = JsonSerializer.Serialize(deadLetter)
                 });
                 Console.WriteLine($"sent to DLQ: partition={result.Partition} offset={result.Offset} reason=simulated-error");
+                commitOffsets[result.TopicPartition] = result.Offset + 1;
+                continue;
+            }
+
+            if (options.FailureMode == "retry-on-error" && appEvent.Level == "Error")
+            {
+                var attempts = result.Message.Headers?.TryGetLastBytes("retry-count", out var countBytes) == true
+                    ? int.Parse(System.Text.Encoding.UTF8.GetString(countBytes))
+                    : 0;
+                if (attempts >= 2)
+                {
+                    await dlqProducer!.ProduceAsync($"{Topic}.dlq", new Message<string, string> { Key = result.Message.Key, Value = result.Message.Value });
+                    Console.WriteLine($"sent to DLQ after {attempts} retries: offset={result.Offset}");
+                    commitOffsets[result.TopicPartition] = result.Offset + 1;
+                    continue;
+                }
+                await retryProducer!.ProduceAsync($"{Topic}.retry", new Message<string, string>
+                {
+                    Key = result.Message.Key,
+                    Value = result.Message.Value,
+                    Headers = new Headers { { "retry-count", System.Text.Encoding.UTF8.GetBytes((attempts + 1).ToString()) } }
+                });
+                Console.WriteLine($"sent to retry: partition={result.Partition} offset={result.Offset}");
                 commitOffsets[result.TopicPartition] = result.Offset + 1;
                 continue;
             }
@@ -136,7 +162,7 @@ static ConsumerOptions ParseOptions(string[] arguments)
             case ("--batch-size", var value) when int.TryParse(value, out var size) && size > 0:
                 batchSize = size;
                 break;
-            case ("--failure-mode", "none" or "dlq-on-error"):
+            case ("--failure-mode", "none" or "dlq-on-error" or "retry-on-error"):
                 failureMode = arguments[index + 1];
                 break;
             default:
